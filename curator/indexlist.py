@@ -134,10 +134,39 @@ class IndexList(object):
         if working_list:
             index_lists = chunk_index_list(working_list)
             for l in index_lists:
-                iterate_over_stats(
-                    self.client.indices.stats(index=to_csv(l),
-                    metric='store,docs')
-                )
+                stats_result = {}
+
+                try:
+                    stats_result.update(self._get_indices_stats(l))
+                except elasticsearch.ElasticsearchException as err:
+                    if err.status_code == 413:
+                        self.loggit.debug('Huge Payload 413 Error - Trying to get information with multiple requests')
+                        stats_result = {}
+                        stats_result.update(self._bulk_queries(l, self._get_indices_stats))
+                        pass
+
+                iterate_over_stats(stats_result)
+
+    def _get_indices_stats(self, data):
+        return self.client.indices.stats(index=to_csv(data), metric='store,docs')
+
+    def _bulk_queries(self, data, exec_func):
+        slice_number = 10
+        query_result = {}
+        loop_number = round(len(data)/slice_number) if round(len(data)/slice_number) > 0 else 1
+        self.loggit.debug("Bulk Queries - number requests created: {0}".format(loop_number))
+
+        for num in range(0, loop_number):
+            if num == (loop_number-1):
+                data_sliced = data[num*slice_number:]
+            else:
+                data_sliced = data[num*slice_number:(num+1)*slice_number]
+            query_result.update(exec_func(data_sliced))
+
+        return query_result
+
+    def _get_cluster_state(self, data):
+        return self.client.cluster.state(index=to_csv(data), metric='metadata')['metadata']['indices']
 
     def _get_metadata(self):
         """
@@ -148,11 +177,16 @@ class IndexList(object):
         self.empty_list_check()
         index_lists = chunk_index_list(self.indices)
         for l in index_lists:
-            working_list = (
-                self.client.cluster.state(
-                    index=to_csv(l),metric='metadata'
-                )['metadata']['indices']
-            )
+            working_list = {}
+            try:
+                working_list.update(self._get_cluster_state(l))
+            except elasticsearch.ElasticsearchException as err:
+                if err.status_code == 413:
+                    self.loggit.debug('Huge Payload 413 Error - Trying to get information with multiple requests')
+                    working_list = {}
+                    working_list.update(self._bulk_queries(l, self._get_cluster_state))
+                    pass
+
             if working_list:
                 for index in list(working_list.keys()):
                     s = self.index_info[index]
@@ -195,7 +229,10 @@ class IndexList(object):
         self.loggit.debug('Generating working list of indices')
         return self.indices[:]
 
-    def _get_segmentcounts(self):
+    def _get_indices_segments(self, data):
+        return self.client.indices.segments(index=to_csv(data))['indices'].copy()
+
+    def _get_segment_counts(self):
         """
         Populate `index_info` with segment information for each index.
         """
@@ -203,9 +240,16 @@ class IndexList(object):
         self.empty_list_check()
         index_lists = chunk_index_list(self.indices)
         for l in index_lists:
-            working_list = (
-                self.client.indices.segments(index=to_csv(l))['indices']
-            )
+            working_list = {}
+            try:
+                working_list.update(self._get_indices_segments(l))
+            except elasticsearch.ElasticsearchException as err:
+                if err.status_code == 413:
+                    self.loggit.debug('Huge Payload 413 Error - Trying to get information with multiple requests')
+                    working_list = {}
+                    working_list.update(self._bulk_queries(l, self._get_indices_segments))
+                    pass
+
             if working_list:
                 for index in list(working_list.keys()):
                     shards = working_list[index]['shards']
@@ -630,7 +674,7 @@ class IndexList(object):
             'Omitting any closed indices.'
         )
         self.filter_closed()
-        self._get_segmentcounts()
+        self._get_segment_counts()
         for index in self.working_list():
             # Do this to reduce long lines and make it more readable...
             shards = int(self.index_info[index]['number_of_shards'])
@@ -736,19 +780,19 @@ class IndexList(object):
 
     def filter_by_alias(self, aliases=None, exclude=False):
         """
-        Match indices which are associated with the alias or list of aliases 
+        Match indices which are associated with the alias or list of aliases
         identified by `aliases`.
 
-        An update to Elasticsearch 5.5.0 changes the behavior of this from 
+        An update to Elasticsearch 5.5.0 changes the behavior of this from
         previous 5.x versions:
         https://www.elastic.co/guide/en/elasticsearch/reference/5.5/breaking-changes-5.5.html#breaking_55_rest_changes
 
         What this means is that indices must appear in all aliases in list
-        `aliases` or a 404 error will result, leading to no indices being 
-        matched.  In older versions, if the index was associated with even one 
+        `aliases` or a 404 error will result, leading to no indices being
+        matched.  In older versions, if the index was associated with even one
         of the aliases in `aliases`, it would result in a match.
 
-        It is unknown if this behavior affects anyone.  At the time this was 
+        It is unknown if this behavior affects anyone.  At the time this was
         written, no users have been bit by this.  The code could be adapted
         to manually loop if the previous behavior is desired.  But if no users
         complain, this will become the accepted/expected behavior.
@@ -818,12 +862,12 @@ class IndexList(object):
         :arg reverse: The filtering direction. (default: `True`).
         :arg use_age: Sort indices by age.  ``source`` is required in this
             case.
-        :arg pattern: Select indices to count from a regular expression 
+        :arg pattern: Select indices to count from a regular expression
             pattern.  This pattern must have one and only one capture group.
             This can allow a single ``count`` filter instance to operate against
             any number of matching patterns, and keep ``count`` of each index
             in that group.  For example, given a ``pattern`` of ``'^(.*)-\d{6}$'``,
-            it will match both ``rollover-000001`` and ``index-999990``, but not 
+            it will match both ``rollover-000001`` and ``index-999990``, but not
             ``logstash-2017.10.12``.  Following the same example, if my cluster
             also had ``rollover-000002`` through ``rollover-000010`` and
             ``index-888888`` through ``index-999999``, it will process both
@@ -903,7 +947,7 @@ class IndexList(object):
                 # Default to sorting by index name
                 sorted_indices = sorted(group, reverse=reverse)
 
-            
+
             idx = 1
             for index in sorted_indices:
                 msg = (
@@ -942,7 +986,7 @@ class IndexList(object):
         :arg date_to_format: The strftime string used to parse ``date_to``
         :arg timestring: An strftime string to match the datestamp in an index
             name. Only used for index filtering by ``name``.
-        :arg unit: One of ``hours``, ``days``, ``weeks``, ``months``, or 
+        :arg unit: One of ``hours``, ``days``, ``weeks``, ``months``, or
             ``years``.
         :arg field: A timestamp field name.  Only used for ``field_stats`` based
             calculations.
@@ -953,9 +997,9 @@ class IndexList(object):
             If `True`, only indices where both `min_value` and `max_value` are
             within the period will be selected. If `False`, it will use whichever
             you specified.  Default is `False` to preserve expected behavior.
-        :arg week_starts_on: Either ``sunday`` or ``monday``. Default is 
+        :arg week_starts_on: Either ``sunday`` or ``monday``. Default is
             ``sunday``
-        :arg epoch: An epoch timestamp used to establish a point of reference 
+        :arg epoch: An epoch timestamp used to establish a point of reference
             for calculations. If not provided, the current time will be used.
         :arg exclude: If `exclude` is `True`, this filter will remove matching
             indices from `indices`. If `exclude` is `False`, then only matching
