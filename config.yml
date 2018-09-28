@@ -1,0 +1,11 @@
+client:
+  hosts:
+    - $hostname
+  port: 80
+
+logging:
+  loglevel: DEBUG
+  logfile:
+  logformat: default
+  blacklist: ['elasticsearch', 'urllib3']
+
